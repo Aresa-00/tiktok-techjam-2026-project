@@ -35,6 +35,29 @@ function Spinner() {
   return <span className="spinner" aria-label="Loading" />;
 }
 
+function RedactionNotice({ run }: { run: AgentRun }) {
+  const redactions = run.redactions ?? [];
+  if (redactions.length === 0) return null;
+  const total = redactions.reduce((sum, item) => sum + item.count, 0);
+  const scope = redactions.some((item) => item.scope === "error")
+    ? "error"
+    : "response";
+  const detail = redactions
+    .map(
+      (item) =>
+        item.rule.replace(/-/g, " ") + (item.count > 1 ? " ×" + item.count : ""),
+    )
+    .join(", ");
+  return (
+    <div className="redaction-notice" role="status">
+      <span aria-hidden="true">🛡</span>
+      <span>
+        Redacted {total} secret{total === 1 ? "" : "s"} from this {scope} · {detail}
+      </span>
+    </div>
+  );
+}
+
 export default function App() {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -537,6 +560,9 @@ export default function App() {
                     <strong>Run failed</strong>
                     <span>{activeRun.error}</span>
                   </article>
+                )}
+                {activeRun && ["completed", "failed"].includes(activeRun.status) && (
+                  <RedactionNotice run={activeRun} />
                 )}
                 <div ref={messageEnd} />
               </div>

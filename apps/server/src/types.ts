@@ -30,6 +30,16 @@ export interface RunUsage {
   outputTokens?: number;
 }
 
+/** One aggregated redaction result for a single run, safe to persist and show. */
+export interface RunRedaction {
+  /** Which channel the secret was caught on. */
+  scope: "output" | "error";
+  /** The detection rule that fired, e.g. "github-token". */
+  rule: string;
+  /** How many times that rule matched in this run. */
+  count: number;
+}
+
 export interface AgentRun {
   id: string;
   agentId: string;
@@ -38,6 +48,7 @@ export interface AgentRun {
   output: string | null;
   error: string | null;
   usage: RunUsage | null;
+  redactions: RunRedaction[];
   startedAt: string | null;
   completedAt: string | null;
   createdAt: string;
@@ -66,6 +77,8 @@ export interface RunnerResult {
   output: string;
   threadId: string | null;
   usage: RunUsage | null;
+  /** Set by redaction middleware; absent when no runner in the chain redacts. */
+  redactions?: RunRedaction[];
 }
 
 export interface RunnerRequest {

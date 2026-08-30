@@ -6,7 +6,12 @@ import { AgentService } from "./agent-service.js";
 import { loadConfig } from "./config.js";
 import { RunCancelledError } from "./errors.js";
 import { createRedactor } from "./redaction.js";
-import { RedactingRunner, type RedactionReport } from "./redacting-runner.js";
+import {
+  RedactedError,
+  RedactingRunner,
+  summarizeRedactions,
+  type RedactionReport,
+} from "./redacting-runner.js";
 import { JsonStore } from "./store.js";
 import type { AgentRunner, RunnerRequest, RunnerResult } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
@@ -60,6 +65,13 @@ describe("RedactingRunner", () => {
     expect(result.threadId).toBe("thread-1");
     expect(result.usage).toEqual({ inputTokens: 3, outputTokens: 9 });
 
+    expect(result.redactions).toEqual(
+      expect.arrayContaining([
+        { scope: "output", rule: "secret-assignment", count: 1 },
+        { scope: "output", rule: "github-token", count: 1 },
+      ]),
+    );
+
     expect(reports).toHaveLength(1);
     expect(reports[0]).toMatchObject({ agentId: "agent-1", scope: "output" });
     expect(reports[0]?.matches.map((match) => match.rule)).toEqual(
@@ -85,11 +97,33 @@ describe("RedactingRunner", () => {
       reports.push(report),
     );
 
-    await expect(
-      runner.run({ agentId: "agent-2", workspacePath: "/tmp", prompt: "p", threadId: null }),
-    ).rejects.toThrow(/ARK_API_KEY=\[REDACTED\] rejected/);
+    const rejection = runner.run({
+      agentId: "agent-2",
+      workspacePath: "/tmp",
+      prompt: "p",
+      threadId: null,
+    });
+    await expect(rejection).rejects.toBeInstanceOf(RedactedError);
+    await expect(rejection).rejects.toThrow(/ARK_API_KEY=\[REDACTED\] rejected/);
+    await expect(rejection).rejects.toMatchObject({
+      redactions: [{ scope: "error", rule: "known-secret", count: 1 }],
+    });
 
     expect(reports[0]).toMatchObject({ agentId: "agent-2", scope: "error" });
+  });
+
+  it("summarizeRedactions collapses matches into counted rows", () => {
+    expect(
+      summarizeRedactions("output", [
+        { rule: "jwt", length: 40 },
+        { rule: "jwt", length: 42 },
+        { rule: "github-token", length: 44 },
+      ]),
+    ).toEqual([
+      { scope: "output", rule: "jwt", count: 2 },
+      { scope: "output", rule: "github-token", count: 1 },
+    ]);
+    expect(summarizeRedactions("error", [])).toEqual([]);
   });
 
   it("rethrows RunCancelledError untouched", async () => {
@@ -156,6 +190,12 @@ describe("RedactingRunner inside AgentService", () => {
     const stored = service.getRun(run.id);
     expect(stored.output).toContain("[REDACTED]");
     expect(stored.output).not.toContain("hunter2-topsecret");
+    expect(stored.redactions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ scope: "output", rule: "secret-assignment" }),
+        expect.objectContaining({ scope: "output", rule: "github-token" }),
+      ]),
+    );
 
     const assistant = service.getMessages(agent.id).at(-1);
     expect(assistant?.role).toBe("assistant");

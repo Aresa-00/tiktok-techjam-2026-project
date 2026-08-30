@@ -1,6 +1,11 @@
 import { RunCancelledError } from "./errors.js";
 import type { Redactor, RedactionMatch } from "./redaction.js";
-import type { AgentRunner, RunnerRequest, RunnerResult } from "./types.js";
+import type {
+  AgentRunner,
+  RunRedaction,
+  RunnerRequest,
+  RunnerResult,
+} from "./types.js";
 
 export interface RedactionReport {
   agentId: string;
@@ -24,6 +29,29 @@ export const logRedaction: RedactionSink = (report) => {
     }),
   );
 };
+
+/** An error whose message has been redacted, carrying the redaction summary. */
+export class RedactedError extends Error {
+  constructor(
+    message: string,
+    readonly redactions: RunRedaction[],
+  ) {
+    super(message);
+    this.name = "RedactedError";
+  }
+}
+
+/** Collapse per-match detail into `{ scope, rule, count }` rows for a run. */
+export function summarizeRedactions(
+  scope: RunRedaction["scope"],
+  matches: readonly RedactionMatch[],
+): RunRedaction[] {
+  const counts = new Map<string, number>();
+  for (const match of matches) {
+    counts.set(match.rule, (counts.get(match.rule) ?? 0) + 1);
+  }
+  return [...counts].map(([rule, count]) => ({ scope, rule, count }));
+}
 
 /**
  * Middleware that wraps any {@link AgentRunner} and scrubs credentials from
@@ -54,14 +82,18 @@ export class RedactingRunner implements AgentRunner {
       if (matches.length > 0) {
         this.report(request.agentId, "error", matches);
       }
-      throw new Error(text);
+      throw new RedactedError(text, summarizeRedactions("error", matches));
     }
 
     const { text, matches } = this.redact(result.output);
     if (matches.length > 0) {
       this.report(request.agentId, "output", matches);
     }
-    return { ...result, output: text };
+    return {
+      ...result,
+      output: text,
+      redactions: summarizeRedactions("output", matches),
+    };
   }
 
   cancel(agentId: string): Promise<boolean> {

@@ -36,10 +36,15 @@ export interface RedactorOptions {
 export const PLACEHOLDER = "[REDACTED]";
 const MIN_LITERAL_LENGTH = 6;
 
+/**
+ * A rule's `mask` returns the replacement text, or `null` to signal "this
+ * looked like a secret but is a placeholder / documentation value" — the match
+ * is then left untouched and not counted.
+ */
 interface Rule {
   name: string;
   pattern: RegExp;
-  mask: (match: string, groups: readonly (string | undefined)[]) => string;
+  mask: (match: string, groups: readonly (string | undefined)[]) => string | null;
 }
 
 const maskWhole = (): string => PLACEHOLDER;
@@ -47,9 +52,26 @@ const maskWhole = (): string => PLACEHOLDER;
 /** Value token that stops before quotes, separators, and our own placeholder. */
 const VALUE = "[^\\s\"',;{}\\[\\]]{3,}";
 const SECRET_KEYS =
-  "password|passwd|pwd|secret|api[_-]?key|apikey|access[_-]?key|secret[_-]?key" +
-  "|private[_-]?key|auth[_-]?token|access[_-]?token|refresh[_-]?token" +
-  "|session[_-]?token|client[_-]?secret|token";
+  "password|passwd|passphrase|pass|pwd|secret|api[_-]?key|apikey" +
+  "|access[_-]?key|secret[_-]?key|private[_-]?key|client[_-]?secret" +
+  "|auth[_-]?token|access[_-]?token|refresh[_-]?token|session[_-]?token|token";
+
+/** Lowercased values that are obviously not real secrets. */
+const NON_SECRET_VALUES = new Set([
+  "required", "optional", "true", "false", "null", "none", "nil", "undefined",
+  "todo", "tbd", "changeme", "change-me", "example", "your-api-key",
+  "your_api_key", "your-token", "redacted", "placeholder", "string", "number",
+  "value", "xxx", "xxxx", "xxxxxxxx", "test", "dummy", "fake", "secret",
+]);
+
+function isPlaceholderValue(value: string): boolean {
+  if (NON_SECRET_VALUES.has(value.toLowerCase())) return true;
+  if (/^[<{[(].*[>}\])]$/.test(value)) return true; // <your-key>, {{TOKEN}}
+  if (/^\$[A-Za-z_{(]/.test(value)) return true; // $VAR, ${VAR}, $(VAR)
+  if (/^[*.\-_·•]+$/.test(value)) return true; // ****, ----, ...
+  if (/replace[-_]?(with|me)?/i.test(value)) return true; // replace-with-your-id
+  return false;
+}
 
 const RULES: readonly Rule[] = [
   {
@@ -94,6 +116,11 @@ const RULES: readonly Rule[] = [
     mask: maskWhole,
   },
   {
+    name: "google-oauth-token",
+    pattern: /\bya29\.[A-Za-z0-9._-]{20,}/g,
+    mask: maskWhole,
+  },
+  {
     name: "slack-token",
     pattern: /\bxox[abprs]-[A-Za-z0-9-]{10,}/g,
     mask: maskWhole,
@@ -104,8 +131,23 @@ const RULES: readonly Rule[] = [
     mask: maskWhole,
   },
   {
+    name: "sendgrid-key",
+    pattern: /\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}/g,
+    mask: maskWhole,
+  },
+  {
+    name: "npm-token",
+    pattern: /\bnpm_[A-Za-z0-9]{36}\b/g,
+    mask: maskWhole,
+  },
+  {
+    name: "twilio-key",
+    pattern: /\bSK[0-9a-fA-F]{32}\b/g,
+    mask: maskWhole,
+  },
+  {
     name: "url-credentials",
-    pattern: /\b(https?:\/\/[^\s/:@]+:)[^\s/@]+@/gi,
+    pattern: /\b([a-z][a-z0-9+.-]*:\/\/[^\s/:@]+:)[^\s/@]+@/gi,
     mask: (_match, groups) => (groups[0] ?? "") + PLACEHOLDER + "@",
   },
   {
@@ -125,8 +167,10 @@ const RULES: readonly Rule[] = [
         ")([\"']?)",
       "gi",
     ),
-    mask: (_match, groups) =>
-      (groups[0] ?? "") + (groups[1] ?? "") + PLACEHOLDER + (groups[3] ?? ""),
+    mask: (_match, groups) => {
+      if (isPlaceholderValue(groups[2] ?? "")) return null;
+      return (groups[0] ?? "") + (groups[1] ?? "") + PLACEHOLDER + (groups[3] ?? "");
+    },
   },
 ];
 
@@ -162,8 +206,12 @@ export function createRedactor(options: RedactorOptions = {}): Redactor {
       text = text.replace(rule.pattern, (...args: unknown[]): string => {
         const match = args[0] as string;
         const groups = args.slice(1, -2) as (string | undefined)[];
+        const masked = rule.mask(match, groups);
+        if (masked === null || masked === match) {
+          return match;
+        }
         matches.push({ rule: rule.name, length: match.length });
-        return rule.mask(match, groups);
+        return masked;
       });
     }
     return { text, matches };
