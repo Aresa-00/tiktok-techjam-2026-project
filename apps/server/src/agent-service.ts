@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { AppConfig } from "./config.js";
 import { isArkConfigured } from "./config.js";
-import { HttpError, RunCancelledError } from "./errors.js";
+import { HttpError, PolicyViolationError, RunCancelledError } from "./errors.js";
 import { JsonStore } from "./store.js";
+import { TraceRecorder } from "./trace-recorder.js";
+import type { TraceStore } from "./trace-store.js";
 import type {
   Agent,
   AgentRun,
@@ -15,6 +17,9 @@ import { WorkspaceManager } from "./workspace.js";
 
 const now = () => new Date().toISOString();
 
+/** Simple guardrail enforced as a real policy_decision span, not just a type. */
+const MAX_PROMPT_LENGTH = 20_000;
+
 export class AgentService {
   private readonly activeExecutions = new Map<string, Promise<void>>();
   private readonly cancellationRequests = new Set<string>();
@@ -24,11 +29,13 @@ export class AgentService {
     private readonly store: JsonStore,
     private readonly workspaces: WorkspaceManager,
     private readonly runner: AgentRunner,
+    private readonly traces: TraceStore,
   ) {}
 
   async initialize(): Promise<void> {
     await this.store.initialize();
     await this.workspaces.initialize();
+    await this.traces.initialize();
     await this.store.mutate((database) => {
       for (const run of database.runs) {
         if (run.status === "queued" || run.status === "running") {
@@ -150,15 +157,55 @@ export class AgentService {
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
   }
 
+  listTraces(filter: {
+    agentId?: string | undefined;
+    status?: "running" | "completed" | "failed" | "cancelled" | undefined;
+    limit?: number | undefined;
+  } = {}) {
+    return this.traces.listTraces(filter);
+  }
+
+  getTrace(id: string) {
+    return this.traces.getTrace(id);
+  }
+
+  onTraceChange(listener: () => void): () => void {
+    return this.traces.onChange(listener);
+  }
+
+  getTraceForRun(runId: string) {
+    this.getRun(runId);
+    const trace = this.traces.getTraceByRunId(runId);
+    if (!trace) {
+      throw new HttpError(404, "No trace recorded for this Run");
+    }
+    return trace;
+  }
+
   async sendMessage(
     agentId: string,
     prompt: string,
+    options: { retryOfRunId?: string | undefined } = {},
   ): Promise<{ run: AgentRun; message: Message }> {
     if (!isArkConfigured(this.config)) {
       throw new HttpError(
         503,
         "Ark is not configured. Set ARK_API_KEY and ARK_MODEL, then restart.",
       );
+    }
+    let retryOfTraceId: string | null = null;
+    if (options.retryOfRunId) {
+      const previousRun = this.getRun(options.retryOfRunId);
+      if (previousRun.agentId !== agentId) {
+        throw new HttpError(400, "That Run belongs to a different Agent");
+      }
+      if (previousRun.status !== "failed" && previousRun.status !== "cancelled") {
+        throw new HttpError(
+          400,
+          "Only a failed or cancelled Run can be retried, not a " + previousRun.status + " one",
+        );
+      }
+      retryOfTraceId = previousRun.traceId ?? null;
     }
     const timestamp = now();
     const runId = randomUUID();
@@ -201,7 +248,7 @@ export class AgentService {
       storedAgent.updatedAt = timestamp;
       return snapshot;
     });
-    const execution = this.executeRun(agentAtStart, run);
+    const execution = this.executeRun(agentAtStart, run, retryOfTraceId);
     this.activeExecutions.set(agentId, execution);
     void execution
       .finally(() => {
@@ -232,7 +279,11 @@ export class AgentService {
     };
   }
 
-  private async executeRun(agentAtStart: Agent, run: AgentRun): Promise<void> {
+  private async executeRun(
+    agentAtStart: Agent,
+    run: AgentRun,
+    retryOfTraceId: string | null = null,
+  ): Promise<void> {
     await this.store.mutate((database) => {
       const storedRun = database.runs.find((item) => item.id === run.id);
       if (storedRun) {
@@ -240,16 +291,55 @@ export class AgentService {
         storedRun.startedAt = now();
       }
     });
+    const trace = await this.traces.createTrace({
+      agentId: agentAtStart.id,
+      agentVersion: agentAtStart.updatedAt,
+      runId: run.id,
+      sessionId: agentAtStart.codexThreadId,
+      actorType: "user",
+      retryOfTraceId,
+    });
+    const recorder = new TraceRecorder(this.traces, trace.id);
+    const rootSpanId = await recorder.startSpan({
+      name: "Agent Run",
+      category: "orchestration",
+      input: { prompt: run.prompt },
+      metadata: { agentId: agentAtStart.id, runId: run.id },
+    });
     try {
       if (this.cancellationRequests.has(agentAtStart.id)) {
         throw new RunCancelledError();
       }
+
+      const policySpanId = await recorder.startSpan({
+        name: "prompt length policy",
+        category: "policy_decision",
+        input: { promptLength: run.prompt.length, limit: MAX_PROMPT_LENGTH },
+      });
+      if (run.prompt.length > MAX_PROMPT_LENGTH) {
+        const message = `Prompt exceeds the ${MAX_PROMPT_LENGTH} character policy limit`;
+        recorder.endSpan(policySpanId, {
+          status: "failed",
+          output: { allowed: false },
+          error: message,
+        });
+        throw new PolicyViolationError(message);
+      }
+      recorder.endSpan(policySpanId, { status: "completed", output: { allowed: true } });
+
       const result = await this.runner.run({
         agentId: agentAtStart.id,
         workspacePath: agentAtStart.workspacePath,
         prompt: run.prompt,
         threadId: agentAtStart.codexThreadId,
+        recorder,
       });
+      recorder.endSpan(rootSpanId, {
+        status: "completed",
+        output: { threadId: result.threadId },
+      });
+      await recorder.flush();
+      await this.traces.endTrace(trace.id, { status: "completed", cause: "completed", usage: result.usage });
       const completedAt = now();
       await this.store.mutate((database) => {
         const storedRun = database.runs.find((item) => item.id === run.id);
@@ -259,6 +349,7 @@ export class AgentService {
         storedRun.output = result.output;
         storedRun.usage = result.usage;
         storedRun.completedAt = completedAt;
+        storedRun.traceId = trace.id;
         database.messages.push({
           id: randomUUID(),
           agentId: agent.id,
@@ -275,7 +366,16 @@ export class AgentService {
     } catch (error) {
       const completedAt = now();
       const cancelled = error instanceof RunCancelledError;
+      const policyBlocked = error instanceof PolicyViolationError;
+      const cause = cancelled ? "user_requested_stop" : policyBlocked ? "policy_blocked" : "runtime_error";
       const message = error instanceof Error ? error.message : String(error);
+      recorder.endSpan(rootSpanId, {
+        status: cancelled ? "cancelled" : "failed",
+        error: message,
+        metadata: { cause },
+      });
+      await recorder.flush();
+      await this.traces.endTrace(trace.id, { status: cancelled ? "cancelled" : "failed", cause });
       await this.store.mutate((database) => {
         const storedRun = database.runs.find((item) => item.id === run.id);
         const agent = database.agents.find((item) => item.id === agentAtStart.id);
@@ -283,6 +383,7 @@ export class AgentService {
           storedRun.status = cancelled ? "cancelled" : "failed";
           storedRun.error = message;
           storedRun.completedAt = completedAt;
+          storedRun.traceId = trace.id;
         }
         if (agent) {
           if (agent.status !== "stopped") {

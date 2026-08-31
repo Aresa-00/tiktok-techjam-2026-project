@@ -8,9 +8,10 @@ Run it locally with Docker, Colima, or rootless Podman, or deploy it to
 Volcengine ECS.
 
 > [!WARNING]
-> This is a single-user proof of concept. It intentionally has no identity,
-> tracing, audit, or hardened sandbox middleware. Do not use production data or
-> credentials. See [SECURITY.md](SECURITY.md).
+> This is a single-user proof of concept. It intentionally has no identity or
+> per-user authorization, and no hardened multi-tenant sandbox. It does now
+> include a trace/audit middleware layer (see below) - do not use production
+> data or credentials regardless. See [SECURITY.md](SECURITY.md).
 
 ## Screenshots
 
@@ -30,6 +31,10 @@ Volcengine ECS.
 - Persistent Agent workspaces and Codex sessions
 - Disposable Docker, Colima, or Podman container for each local turn
 - Docker and Terraform deployment paths for Volcengine ECS
+- **Trace and audit middleware**: every Run is recorded as a Trace of
+  categorized, redacted Spans, live-streamed to a Traces tab with tree and
+  timeline views, a prompt-length policy guardrail, retry chains, and
+  per-category filtering. See [Trace and audit middleware](#trace-and-audit-middleware) below.
 
 ## Requirements
 
@@ -221,6 +226,8 @@ flowchart LR
     Runtime -->|ECS profile| Codex["Codex CLI in application container"]
     Container --> Ark["Volcengine Ark Responses API"]
     Codex --> Ark
+    API --> Traces["TraceStore (traces.json)"]
+    Traces -->|SSE| UI
 ```
 
 The first turn uses `codex exec`; later turns resume the stored Codex thread.
@@ -228,6 +235,54 @@ Deleting an Agent archives its workspace under `workspaces/.deleted/`.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for component and extension
 boundaries.
+
+## Trace and audit middleware
+
+Every Agent Run is recorded as a **Trace**: a tree of categorized, redacted
+**Spans** covering orchestration, model calls, tool calls, sandbox execution,
+workspace edits, and an automated policy check - viewable live in the
+**Traces** tab next to Playground.
+
+### What it does
+
+- **A real guardrail, not just a log.** Every prompt is checked against a
+  20,000-character policy limit *before* it reaches the Runtime, recorded as
+  a `policy_decision` span. A blocked Run never invokes Codex.
+- **Accurate pass/fail, not just "the event parsed."** A failing shell
+  command, a failed file edit, or a Codex `turn.failed` all show up as a
+  failed span with the real error - not a silently "completed" one.
+- **Two ways to read a Run**: an expandable **Tree** (parent/child spans) and
+  a **Timeline** (waterfall bars on a shared time axis), each filterable by
+  span category.
+- **Jump to failing step** auto-expands, highlights, and scrolls to the
+  first failed span in a Run.
+- **Retry chains**: retrying a failed or cancelled Run links the new attempt
+  back to the one it retries (`attempt` count, bidirectional breadcrumbs).
+  Retrying a Run that didn't actually fail is rejected.
+- **Live, not polled.** The Run list and trace detail both stream over
+  Server-Sent Events.
+- **Redaction before storage.** Secrets are stripped and long payloads
+  truncated before anything is written to disk, not just before display.
+- **Export.** Any trace can be downloaded as JSON for offline inspection.
+
+### Try it
+
+1. Send a normal prompt from the Playground, then open the **Traces** tab and
+   select the Run to watch its spans populate.
+2. Trigger the policy guardrail: send a prompt of 20,000+ characters and
+   watch it get blocked before the Runtime ever runs.
+3. Ask the Agent to run something that will fail (e.g. a failing test) and
+   use **Jump to failing step** to locate the exact failed span.
+4. On a failed Run, click **Retry** (available in both the Playground error
+   card and the Traces detail panel) and see the attempt chain link the two
+   Runs together.
+5. Use the category filter chips above the span tree/timeline to isolate,
+   for example, just the `tool_call` spans in a busy Run.
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#trace-and-audit-middleware)
+for the data model, sequence diagram, and API surface
+(`GET /api/traces`, `GET /api/traces/:id`, `GET /api/traces/:id/export`,
+`GET /api/traces/stream`, `GET /api/traces/:id/stream`).
 
 ## Validation
 

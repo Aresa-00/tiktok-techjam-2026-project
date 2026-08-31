@@ -36,6 +36,68 @@ export interface AgentRun {
     outputTokens?: number;
   } | null;
   createdAt: string;
+  traceId?: string;
+}
+
+export type SpanStatus = "running" | "completed" | "failed" | "cancelled";
+export type TraceCause = "completed" | "user_requested_stop" | "policy_blocked" | "runtime_error";
+export type SpanCategory =
+  | "orchestration"
+  | "model_call"
+  | "tool_call"
+  | "sandbox_execution"
+  | "workspace_operation"
+  | "policy_decision";
+
+export interface Span {
+  id: string;
+  traceId: string;
+  parentSpanId: string | null;
+  name: string;
+  category: SpanCategory;
+  status: SpanStatus;
+  startedAt: string;
+  endedAt: string | null;
+  durationMs: number | null;
+  input: string | null;
+  output: string | null;
+  error: string | null;
+  metadata: Record<string, unknown>;
+}
+
+export interface Trace {
+  id: string;
+  agentId: string;
+  agentVersion: string;
+  runId: string;
+  sessionId: string | null;
+  actorType: "user" | "system";
+  status: SpanStatus;
+  cause: TraceCause | null;
+  retryOfTraceId: string | null;
+  retriedByTraceId: string | null;
+  attempt: number;
+  startedAt: string;
+  endedAt: string | null;
+  durationMs: number | null;
+  usage: AgentRun["usage"];
+  spans: Span[];
+}
+
+export interface TraceSummary {
+  id: string;
+  agentId: string;
+  runId: string;
+  status: SpanStatus;
+  cause: TraceCause | null;
+  retryOfTraceId: string | null;
+  attempt: number;
+  startedAt: string;
+  endedAt: string | null;
+  durationMs: number | null;
+  spanCount: number;
+  errorSpanCount: number;
+  usage: AgentRun["usage"];
 }
 
 export interface SystemInfo {

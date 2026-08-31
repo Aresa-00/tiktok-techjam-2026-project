@@ -142,6 +142,15 @@ export class ContainerCodexRunner implements AgentRunner {
       throw new Error("Agent already has an active Runtime container");
     }
 
+    const recorder = request.recorder;
+    const execSpanId = recorder
+      ? await recorder.startSpan({
+          name: "container run: codex exec",
+          category: "sandbox_execution",
+          input: { prompt: request.prompt, resumingThreadId: request.threadId },
+          metadata: { engine: this.config.containerEngine, provider: "container" },
+        })
+      : null;
     const child = spawn(
       this.config.containerEngine,
       buildContainerRunArgs(request, this.config),
@@ -187,7 +196,7 @@ export class ContainerCodexRunner implements AgentRunner {
         stdout += chunk.toString("utf8");
         const lines = stdout.split(/\r?\n/);
         stdout = lines.pop() ?? "";
-        for (const line of lines) parseCodexEventLine(line, parsed);
+        for (const line of lines) parseCodexEventLine(line, parsed, recorder);
       } else {
         stderr += chunk.toString("utf8");
         if (stderr.length > 16_384) stderr = stderr.slice(-16_384);
@@ -208,7 +217,7 @@ export class ContainerCodexRunner implements AgentRunner {
         child.once("error", reject);
         child.once("close", (code) => resolve(code ?? 1));
       });
-      if (stdout.trim()) parseCodexEventLine(stdout.trim(), parsed);
+      if (stdout.trim()) parseCodexEventLine(stdout.trim(), parsed, recorder);
       if (active.cancelled) throw new RunCancelledError();
       if (active.timedOut) {
         throw new Error("Runtime timed out after " + this.config.codexTimeoutMs + " ms");
@@ -228,10 +237,27 @@ export class ContainerCodexRunner implements AgentRunner {
       }
       const output = parsed.messages.at(-1)?.trim();
       if (!output) throw new Error("Codex completed without an agent message");
-      return { output, threadId: parsed.threadId, usage: parsed.usage };
+      const result: RunnerResult = { output, threadId: parsed.threadId, usage: parsed.usage };
+      if (execSpanId && recorder) {
+        recorder.endSpan(execSpanId, {
+          status: "completed",
+          output: { threadId: result.threadId, usage: result.usage, exitCode },
+        });
+      }
+      return result;
+    } catch (error) {
+      if (execSpanId && recorder) {
+        const cancelled = error instanceof RunCancelledError;
+        recorder.endSpan(execSpanId, {
+          status: cancelled ? "cancelled" : "failed",
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      throw error;
     } finally {
       clearTimeout(timeout);
       this.active.delete(request.agentId);
+      if (recorder) await recorder.flush();
     }
   }
 

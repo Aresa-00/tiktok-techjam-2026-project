@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, setAuthToken } from "./api";
 import type { Agent, AgentRun, Message, SystemInfo } from "./types";
+import TracesView from "./TracesView";
 
 const starterPrompts = [
   "Create a small TypeScript CLI that prints a weather summary from sample JSON.",
@@ -42,6 +43,7 @@ export default function App() {
   const [system, setSystem] = useState<SystemInfo | null>(null);
   const [showCreate, setShowCreate] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [view, setView] = useState<"playground" | "traces">("playground");
   const [form, setForm] = useState(emptyForm);
   const [prompt, setPrompt] = useState("");
   const [activeRun, setActiveRun] = useState<AgentRun | null>(null);
@@ -220,14 +222,11 @@ export default function App() {
     }
   };
 
-  const sendMessage = async (event: React.FormEvent) => {
-    event.preventDefault();
-    if (!selected || !prompt.trim()) return;
-    const content = prompt.trim();
-    setPrompt("");
+  const submitPrompt = async (content: string, retryOfRunId?: string) => {
+    if (!selected) return;
     setError(null);
     try {
-      const result = await api.sendMessage(selected.id, content);
+      const result = await api.sendMessage(selected.id, content, retryOfRunId);
       if (selectedIdRef.current === selected.id) {
         setMessages((current) => [...current, result.message]);
         setActiveRun(result.run);
@@ -242,6 +241,25 @@ export default function App() {
       setError(reason instanceof Error ? reason.message : String(reason));
       setActiveRun(null);
       await refreshAgents();
+    }
+  };
+
+  const sendMessage = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!selected || !prompt.trim()) return;
+    const content = prompt.trim();
+    setPrompt("");
+    await submitPrompt(content);
+  };
+
+  const [retryingRunId, setRetryingRunId] = useState<string | null>(null);
+
+  const retryRun = async (run: AgentRun) => {
+    setRetryingRunId(run.id);
+    try {
+      await submitPrompt(run.prompt, run.id);
+    } finally {
+      setRetryingRunId(null);
     }
   };
 
@@ -331,6 +349,21 @@ export default function App() {
           <span>＋</span> Create Agent
         </button>
 
+        <div className="view-toggle">
+          <button
+            className={"view-toggle-tab " + (view === "playground" ? "active" : "")}
+            onClick={() => setView("playground")}
+          >
+            Playground
+          </button>
+          <button
+            className={"view-toggle-tab " + (view === "traces" ? "active" : "")}
+            onClick={() => setView("traces")}
+          >
+            Traces
+          </button>
+        </div>
+
         <div className="sidebar-label">
           <span>Your Agents</span>
           <span>{agents.length}</span>
@@ -392,7 +425,9 @@ export default function App() {
           </div>
         )}
 
-        {selected ? (
+        {view === "traces" ? (
+          <TracesView agentId={selectedId} />
+        ) : selected ? (
           <>
             <header className="agent-header">
               <div>
@@ -536,6 +571,13 @@ export default function App() {
                   <article className="run-error">
                     <strong>Run failed</strong>
                     <span>{activeRun.error}</span>
+                    <button
+                      className="button button-ghost run-error-retry"
+                      onClick={() => retryRun(activeRun)}
+                      disabled={retryingRunId === activeRun.id}
+                    >
+                      {retryingRunId === activeRun.id ? "Retrying…" : "Retry"}
+                    </button>
                   </article>
                 )}
                 <div ref={messageEnd} />

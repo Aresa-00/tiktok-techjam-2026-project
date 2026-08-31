@@ -3,6 +3,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import type { AppConfig } from "./config.js";
 import { RunCancelledError } from "./errors.js";
+import type { TraceRecorder } from "./trace-recorder.js";
 import type {
   AgentRunner,
   RunUsage,
@@ -41,7 +42,52 @@ export function buildCodexArgs(
   return args;
 }
 
-export function parseCodexEventLine(line: string, parsed: ParsedEvents): void {
+/** Maps a Codex `item.completed` item type to a Trace span category. */
+function spanCategoryForItem(itemType: string): "model_call" | "tool_call" | "workspace_operation" {
+  if (itemType === "agent_message" || itemType === "reasoning") return "model_call";
+  if (itemType === "file_change" || itemType === "patch_apply") return "workspace_operation";
+  return "tool_call";
+}
+
+/**
+ * Codex item payloads carry their own outcome. `command_execution`,
+ * `file_change`, and `mcp_tool_call` items all use the same
+ * `status: "in_progress" | "completed" | "failed"` convention (plus
+ * `exit_code` for commands). A bare `item.type === "error"` item has
+ * neither field but is itself always a failure - so it needs a special
+ * case, not just "no status field present means it succeeded".
+ */
+function spanStatusForItem(itemType: string, item: Record<string, unknown>): "completed" | "failed" {
+  if (itemType === "error") return "failed";
+  if (item.status === "failed") return "failed";
+  if (typeof item.exit_code === "number" && item.exit_code !== 0) return "failed";
+  return "completed";
+}
+
+function spanErrorForItem(itemType: string, item: Record<string, unknown>): string | null {
+  if (itemType === "error") {
+    return typeof item.message === "string" ? item.message : "Codex reported an item-level error";
+  }
+  const failedByStatus = item.status === "failed";
+  const failedByExitCode = typeof item.exit_code === "number" && item.exit_code !== 0;
+  if (!failedByStatus && !failedByExitCode) return null;
+  if (itemType === "command_execution") {
+    const command = typeof item.command === "string" ? item.command : "command";
+    const exitCode = typeof item.exit_code === "number" ? item.exit_code : "unknown";
+    return `${command} exited with code ${exitCode}`;
+  }
+  // file_change, mcp_tool_call, etc. use status only - no exit code to report.
+  return `${itemType} failed`;
+}
+
+/** Codex reuses type="error" for transient stream hiccups it's already retrying internally. */
+const TRANSIENT_STREAM_NOTICE = /^reconnecting/i;
+
+export function parseCodexEventLine(
+  line: string,
+  parsed: ParsedEvents,
+  recorder?: TraceRecorder,
+): void {
   let event: Record<string, unknown>;
   try {
     event = JSON.parse(line) as Record<string, unknown>;
@@ -51,13 +97,29 @@ export function parseCodexEventLine(line: string, parsed: ParsedEvents): void {
 
   if (event.type === "thread.started" && typeof event.thread_id === "string") {
     parsed.threadId = event.thread_id;
+    recorder?.recordInstant({
+      name: "thread.started",
+      category: "orchestration",
+      status: "completed",
+      output: { threadId: event.thread_id },
+    });
   }
 
   if (event.type === "item.completed" && event.item && typeof event.item === "object") {
     const item = event.item as Record<string, unknown>;
-    if (item.type === "agent_message" && typeof item.text === "string") {
+    const itemType = typeof item.type === "string" ? item.type : "unknown_item";
+    if (itemType === "agent_message" && typeof item.text === "string") {
       parsed.messages.push(item.text);
     }
+    recorder?.recordInstant({
+      name: `item.completed: ${itemType}`,
+      category: spanCategoryForItem(itemType),
+      status: spanStatusForItem(itemType, item),
+      error: spanErrorForItem(itemType, item),
+      // The full item can include command output / file contents; the store
+      // redacts and length-caps it before persisting.
+      output: item,
+    });
   }
 
   if (event.type === "turn.completed" && event.usage && typeof event.usage === "object") {
@@ -73,6 +135,28 @@ export function parseCodexEventLine(line: string, parsed: ParsedEvents): void {
         ? { outputTokens: usage.output_tokens }
         : {}),
     };
+    recorder?.recordInstant({
+      name: "turn.completed",
+      category: "model_call",
+      status: "completed",
+      output: { usage: parsed.usage },
+    });
+  }
+
+  if (event.type === "turn.failed") {
+    const errorDetail =
+      event.error && typeof event.error === "object" ? (event.error as Record<string, unknown>) : undefined;
+    const message =
+      typeof errorDetail?.message === "string" ? errorDetail.message : "Codex turn failed";
+    // Feed the outer exitCode!==0 branch the same way a stream-level "error"
+    // event does, so the Run - not just one span - actually ends up failed.
+    parsed.errors.push(message);
+    recorder?.recordInstant({
+      name: "turn.failed",
+      category: "model_call",
+      status: "failed",
+      error: message,
+    });
   }
 
   if (event.type === "error") {
@@ -82,7 +166,27 @@ export function parseCodexEventLine(line: string, parsed: ParsedEvents): void {
         : typeof event.error === "string"
           ? event.error
           : "Codex reported an unknown error";
+    // Codex reuses type="error" for transient, non-fatal stream hiccups too
+    // (e.g. "Reconnecting... 1/5" while it retries a dropped connection
+    // mid-turn). Only a genuine, non-transient error should fail a span -
+    // otherwise "jump to failing step" would point at network noise instead
+    // of the actual problem.
+    if (TRANSIENT_STREAM_NOTICE.test(message)) {
+      recorder?.recordInstant({
+        name: "codex.stream-notice",
+        category: "orchestration",
+        status: "completed",
+        output: { message },
+      });
+      return;
+    }
     parsed.errors.push(message);
+    recorder?.recordInstant({
+      name: "codex.error",
+      category: "orchestration",
+      status: "failed",
+      error: message,
+    });
   }
 }
 
@@ -130,6 +234,15 @@ export class CodexRunner implements AgentRunner {
     }
 
     const args = buildCodexArgs(request, this.config.codexSandboxMode);
+    const recorder = request.recorder;
+    const execSpanId = recorder
+      ? await recorder.startSpan({
+          name: "codex exec",
+          category: "sandbox_execution",
+          input: { prompt: request.prompt, resumingThreadId: request.threadId },
+          metadata: { sandboxMode: this.config.codexSandboxMode, provider: "local-process" },
+        })
+      : null;
     const child = spawn(this.config.codexBin, args, {
       cwd: request.workspacePath,
       env: this.childEnvironment(),
@@ -171,7 +284,7 @@ export class CodexRunner implements AgentRunner {
         const lines = stdout.split(/\r?\n/);
         stdout = lines.pop() ?? "";
         for (const line of lines) {
-          parseCodexEventLine(line, parsed);
+          parseCodexEventLine(line, parsed, recorder);
         }
       } else {
         stderr += chunk.toString("utf8");
@@ -196,7 +309,7 @@ export class CodexRunner implements AgentRunner {
         child.once("close", (code) => resolve(code ?? 1));
       });
       if (stdout.trim()) {
-        parseCodexEventLine(stdout.trim(), parsed);
+        parseCodexEventLine(stdout.trim(), parsed, recorder);
       }
       if (active.cancelled) {
         throw new RunCancelledError();
@@ -215,15 +328,32 @@ export class CodexRunner implements AgentRunner {
       if (!output) {
         throw new Error("Codex completed without an agent message");
       }
-      return {
+      const result: RunnerResult = {
         output,
         threadId: parsed.threadId,
         usage: parsed.usage,
       };
+      if (execSpanId && recorder) {
+        recorder.endSpan(execSpanId, {
+          status: "completed",
+          output: { threadId: result.threadId, usage: result.usage, exitCode },
+        });
+      }
+      return result;
+    } catch (error) {
+      if (execSpanId && recorder) {
+        const cancelled = error instanceof RunCancelledError;
+        recorder.endSpan(execSpanId, {
+          status: cancelled ? "cancelled" : "failed",
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      throw error;
     } finally {
       clearTimeout(timeout);
       if (active.forceKillTimer) clearTimeout(active.forceKillTimer);
       this.active.delete(request.agentId);
+      if (recorder) await recorder.flush();
     }
   }
 
