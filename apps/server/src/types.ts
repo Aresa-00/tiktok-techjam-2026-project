@@ -52,6 +52,8 @@ export interface AgentRun {
   startedAt: string | null;
   completedAt: string | null;
   createdAt: string;
+  /** Set once the Run's Trace exists, so the UI can link straight to it. */
+  traceId?: string;
 }
 
 export interface Database {
@@ -86,6 +88,8 @@ export interface RunnerRequest {
   workspacePath: string;
   prompt: string;
   threadId: string | null;
+  /** Optional: when present, the runner emits spans for this Run's Trace. */
+  recorder?: import("./trace-recorder.js").TraceRecorder | undefined;
 }
 
 export interface AgentRunner {

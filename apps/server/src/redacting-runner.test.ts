@@ -15,6 +15,7 @@ import {
 import { JsonStore } from "./store.js";
 import type { AgentRunner, RunnerRequest, RunnerResult } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
+import { TraceStore } from "./trace-store.js";
 
 const LEAK =
   'Done. Wrote config with password=hunter2-topsecret and ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.';
@@ -180,6 +181,7 @@ describe("RedactingRunner inside AgentService", () => {
       new JsonStore(path.join(root, "data", "db.json")),
       new WorkspaceManager(path.join(root, "workspaces")),
       runner,
+      new TraceStore(path.join(root, "data", "traces.json"))
     );
     await service.initialize();
 

@@ -21,6 +21,13 @@ const updateAgentBody = createAgentBody.partial().refine(
 );
 const messageBody = z.object({
   content: z.string().trim().min(1).max(50_000),
+  retryOfRunId: z.string().uuid().optional(),
+});
+const traceIdParams = z.object({ id: z.string().uuid() });
+const tracesQuery = z.object({
+  agentId: z.string().uuid().optional(),
+  status: z.enum(["running", "completed", "failed", "cancelled"]).optional(),
+  limit: z.coerce.number().int().min(1).max(200).optional(),
 });
 
 export async function createApp(
@@ -52,7 +59,13 @@ export async function createApp(
       return;
     }
     const header = request.headers.authorization ?? "";
-    const candidate = header.startsWith("Bearer ") ? header.slice(7) : "";
+    let candidate = header.startsWith("Bearer ") ? header.slice(7) : "";
+    // EventSource cannot set custom headers, so SSE stream routes also accept
+    // the token as a query param. Scoped narrowly to /stream paths only.
+    if (!candidate && request.url.includes("/stream") && typeof request.query === "object") {
+      const query = request.query as Record<string, unknown>;
+      if (typeof query.token === "string") candidate = query.token;
+    }
     const expectedBuffer = Buffer.from(config.authToken);
     const candidateBuffer = Buffer.from(candidate);
     const valid =
@@ -119,13 +132,112 @@ export async function createApp(
   app.post("/api/agents/:id/messages", async (request, reply) => {
     const { id } = agentIdParams.parse(request.params);
     const body = messageBody.parse(request.body);
-    const result = await service.sendMessage(id, body.content);
+    const result = await service.sendMessage(id, body.content, {
+      retryOfRunId: body.retryOfRunId,
+    });
     return reply.code(202).send(result);
   });
 
   app.get("/api/runs/:id", async (request) => {
     const { id } = runIdParams.parse(request.params);
     return { run: service.getRun(id) };
+  });
+
+  app.get("/api/runs/:id/trace", async (request) => {
+    const { id } = runIdParams.parse(request.params);
+    return { trace: service.getTraceForRun(id) };
+  });
+
+  app.get("/api/traces", async (request) => {
+    const query = tracesQuery.parse(request.query);
+    return { traces: service.listTraces(query) };
+  });
+
+  app.get("/api/traces/stream", async (request, reply) => {
+    const query = tracesQuery.parse(request.query);
+    reply.hijack();
+    reply.raw.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+    let lastPayload = "";
+    const send = () => {
+      const payload = JSON.stringify(service.listTraces(query));
+      if (payload !== lastPayload) {
+        lastPayload = payload;
+        reply.raw.write(`data: ${payload}\n\n`);
+      }
+    };
+    send();
+    const unsubscribeChange = service.onTraceChange(send);
+    const heartbeat = setInterval(send, 3000);
+    request.raw.on("close", () => {
+      clearInterval(heartbeat);
+      unsubscribeChange();
+      reply.raw.end();
+    });
+  });
+
+  app.get("/api/traces/:id", async (request) => {
+    const { id } = traceIdParams.parse(request.params);
+    return { trace: service.getTrace(id) };
+  });
+
+  app.get("/api/traces/:id/stream", async (request, reply) => {
+    const { id } = traceIdParams.parse(request.params);
+    reply.hijack();
+    reply.raw.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+    let lastPayload = "";
+    let closed = false;
+    const send = () => {
+      if (closed) return;
+      let trace;
+      try {
+        trace = service.getTrace(id);
+      } catch {
+        reply.raw.write("event: not_found\ndata: {}\n\n");
+        return end();
+      }
+      const payload = JSON.stringify(trace);
+      if (payload !== lastPayload) {
+        lastPayload = payload;
+        reply.raw.write(`data: ${payload}\n\n`);
+      }
+      // Deliberately NOT closing once trace.status leaves "running": a
+      // terminal trace can still change afterward - specifically,
+      // retriedByTraceId gets set the moment someone retries this Run,
+      // which happens strictly after it already reached a terminal status.
+      // Closing here would leave the retry breadcrumb stuck stale until the
+      // client manually reselects the trace.
+    };
+    const end = () => {
+      if (closed) return;
+      closed = true;
+      clearInterval(unsubscribeTimer);
+      unsubscribeChange();
+      reply.raw.end();
+    };
+    send();
+    // Push on every store mutation for low latency, with a slow poll as a
+    // safety net in case a listener is ever missed.
+    const unsubscribeChange = service.onTraceChange(send);
+    const unsubscribeTimer = setInterval(send, 2000);
+    request.raw.on("close", end);
+  });
+
+  app.get("/api/traces/:id/export", async (request, reply) => {
+    const { id } = traceIdParams.parse(request.params);
+    const trace = service.getTrace(id);
+    reply.header(
+      "Content-Disposition",
+      `attachment; filename="trace-${trace.id}.json"`,
+    );
+    return trace;
   });
 
   if (config.nodeEnv === "production") {

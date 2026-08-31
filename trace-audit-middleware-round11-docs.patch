@@ -1,0 +1,262 @@
+diff --git a/README.md b/README.md
+index d91a731..a8d9b53 100644
+--- a/README.md
++++ b/README.md
+@@ -8,9 +8,10 @@ Run it locally with Docker, Colima, or rootless Podman, or deploy it to
+ Volcengine ECS.
+ 
+ > [!WARNING]
+-> This is a single-user proof of concept. It intentionally has no identity,
+-> tracing, audit, or hardened sandbox middleware. Do not use production data or
+-> credentials. See [SECURITY.md](SECURITY.md).
++> This is a single-user proof of concept. It intentionally has no identity or
++> per-user authorization, and no hardened multi-tenant sandbox. It does now
++> include a trace/audit middleware layer (see below) - do not use production
++> data or credentials regardless. See [SECURITY.md](SECURITY.md).
+ 
+ ## Screenshots
+ 
+@@ -30,6 +31,10 @@ Volcengine ECS.
+ - Persistent Agent workspaces and Codex sessions
+ - Disposable Docker, Colima, or Podman container for each local turn
+ - Docker and Terraform deployment paths for Volcengine ECS
++- **Trace and audit middleware**: every Run is recorded as a Trace of
++  categorized, redacted Spans, live-streamed to a Traces tab with tree and
++  timeline views, a prompt-length policy guardrail, retry chains, and
++  per-category filtering. See [Trace and audit middleware](#trace-and-audit-middleware) below.
+ 
+ ## Requirements
+ 
+@@ -221,6 +226,8 @@ flowchart LR
+     Runtime -->|ECS profile| Codex["Codex CLI in application container"]
+     Container --> Ark["Volcengine Ark Responses API"]
+     Codex --> Ark
++    API --> Traces["TraceStore (traces.json)"]
++    Traces -->|SSE| UI
+ ```
+ 
+ The first turn uses `codex exec`; later turns resume the stored Codex thread.
+@@ -229,6 +236,54 @@ Deleting an Agent archives its workspace under `workspaces/.deleted/`.
+ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for component and extension
+ boundaries.
+ 
++## Trace and audit middleware
++
++Every Agent Run is recorded as a **Trace**: a tree of categorized, redacted
++**Spans** covering orchestration, model calls, tool calls, sandbox execution,
++workspace edits, and an automated policy check - viewable live in the
++**Traces** tab next to Playground.
++
++### What it does
++
++- **A real guardrail, not just a log.** Every prompt is checked against a
++  20,000-character policy limit *before* it reaches the Runtime, recorded as
++  a `policy_decision` span. A blocked Run never invokes Codex.
++- **Accurate pass/fail, not just "the event parsed."** A failing shell
++  command, a failed file edit, or a Codex `turn.failed` all show up as a
++  failed span with the real error - not a silently "completed" one.
++- **Two ways to read a Run**: an expandable **Tree** (parent/child spans) and
++  a **Timeline** (waterfall bars on a shared time axis), each filterable by
++  span category.
++- **Jump to failing step** auto-expands, highlights, and scrolls to the
++  first failed span in a Run.
++- **Retry chains**: retrying a failed or cancelled Run links the new attempt
++  back to the one it retries (`attempt` count, bidirectional breadcrumbs).
++  Retrying a Run that didn't actually fail is rejected.
++- **Live, not polled.** The Run list and trace detail both stream over
++  Server-Sent Events.
++- **Redaction before storage.** Secrets are stripped and long payloads
++  truncated before anything is written to disk, not just before display.
++- **Export.** Any trace can be downloaded as JSON for offline inspection.
++
++### Try it
++
++1. Send a normal prompt from the Playground, then open the **Traces** tab and
++   select the Run to watch its spans populate.
++2. Trigger the policy guardrail: send a prompt of 20,000+ characters and
++   watch it get blocked before the Runtime ever runs.
++3. Ask the Agent to run something that will fail (e.g. a failing test) and
++   use **Jump to failing step** to locate the exact failed span.
++4. On a failed Run, click **Retry** (available in both the Playground error
++   card and the Traces detail panel) and see the attempt chain link the two
++   Runs together.
++5. Use the category filter chips above the span tree/timeline to isolate,
++   for example, just the `tool_call` spans in a busy Run.
++
++See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#trace-and-audit-middleware)
++for the data model, sequence diagram, and API surface
++(`GET /api/traces`, `GET /api/traces/:id`, `GET /api/traces/:id/export`,
++`GET /api/traces/stream`, `GET /api/traces/:id/stream`).
++
+ ## Validation
+ 
+ ```bash
+diff --git a/docs/ARCHITECTURE.md b/docs/ARCHITECTURE.md
+index 30d7aaf..7cabdd3 100644
+--- a/docs/ARCHITECTURE.md
++++ b/docs/ARCHITECTURE.md
+@@ -13,6 +13,7 @@ flowchart LR
+     Runner -->|ECS| Process["Codex child process"]
+     Container --> Ark["Volcengine Ark"]
+     Process --> Ark
++    Service --> Traces["TraceStore"]
+ ```
+ 
+ ## Components
+@@ -20,7 +21,8 @@ flowchart LR
+ ### Web UI
+ 
+ Lists Agents, manages lifecycle actions, submits prompts, and polls asynchronous
+-Runs. It never receives the Ark API key.
++Runs. It never receives the Ark API key. A second view, the Traces tab, is a
++read path over the trace/audit middleware described below.
+ 
+ ### Fastify API
+ 
+@@ -45,13 +47,15 @@ Interrupted Runs become `cancelled` after a restart.
+ 
+ ```text
+ data/launchpad.json       Agent, message, and Run metadata
++data/traces.json          Trace and span audit records
+ workspaces/AgentID/       Agent-created files
+ workspaces/.deleted/      Archived deleted workspaces
+ codex-home/               Codex configuration and sessions
+ ```
+ 
+-`JsonStore` serializes writes and atomically replaces one JSON file. It supports
+-one process only.
++`JsonStore` and `TraceStore` each serialize writes and atomically replace one
++JSON file. Both support one process only. They are kept as separate files so
++a busy Run's span writes never contend with Agent/Run persistence.
+ 
+ ### Runtime providers
+ 
+@@ -60,23 +64,117 @@ one process only.
+   container for every local turn.
+ 
+ Both providers use argv-only process execution, bound output and time, resume
+-the stored Codex thread, and escalate termination after a grace period.
++the stored Codex thread, and escalate termination after a grace period. Both
++also accept an optional `TraceRecorder`, so the same instrumentation covers
++whichever provider is active.
+ 
+ ## Deployment profiles
+ 
+-| Profile | Control plane | Agent execution |
++| Profile           | Control plane          | Agent execution                     |
++| ------------------ | ----------------------- | ------------------------------------ |
++| Local POC         | Host Node.js           | Disposable local container          |
++| ECS               | Application container  | Codex process in the same container |
++| Local development | Host Node.js           | Host Codex process                  |
++
++## Trace and audit middleware
++
++Every Agent Run is wrapped in a **Trace**: a tree of **Spans** that turns "the
++Agent did something" into a reconstructable sequence of what it did, when,
++and why it ended the way it did.
++
++```mermaid
++sequenceDiagram
++    participant UI as Web UI (Playground / Traces)
++    participant API as Fastify API
++    participant Svc as AgentService
++    participant Rec as TraceRecorder
++    participant Run as AgentRunner (Codex)
++    participant TS as TraceStore (traces.json)
++
++    UI->>API: POST /api/agents/:id/messages
++    API->>Svc: sendMessage(prompt, retryOfRunId?)
++    Svc->>TS: createTrace()
++    Svc->>Rec: startSpan(orchestration: "Agent Run")
++    Svc->>Rec: startSpan(policy_decision: prompt length)
++    Rec->>TS: persist span
++    Svc->>Run: run({ prompt, recorder })
++    loop Codex --json event stream
++        Run->>Rec: recordInstant(model_call / tool_call / workspace_operation)
++        Rec->>TS: persist span
++    end
++    Run-->>Svc: RunnerResult (output, usage)
++    Svc->>Rec: endSpan(orchestration, completed/failed/cancelled)
++    Svc->>TS: endTrace(status, cause, usage)
++    TS-->>UI: SSE push (list + per-trace stream)
++```
++
++### Data model
++
++- **Trace** - `id`, `agentId`, `agentVersion`, `runId`, `sessionId`
++  (Codex thread), `actorType`, `status`, `cause`, `retryOfTraceId`,
++  `retriedByTraceId`, `attempt`, timing, token `usage`, and its `spans`.
++- **Span** - `id`, `traceId`, `parentSpanId`, `name`, `category`, `status`,
++  timing, redacted `input`/`output`, `error`, `metadata`.
++- **Span categories**: `orchestration`, `model_call`, `tool_call`,
++  `sandbox_execution`, `workspace_operation`, `policy_decision`.
++- **Trace causes**: `completed`, `user_requested_stop`, `policy_blocked`,
++  `runtime_error` - lets the UI distinguish "the user stopped it" from
++  "it broke" from "an automated guardrail blocked it," without inspecting
++  free-text error strings.
++
++### Where spans come from
++
++| Source | Span category | Notes |
+ | --- | --- | --- |
+-| Local POC | Host Node.js | Disposable local container |
+-| ECS | Application container | Codex process in the same container |
+-| Local development | Host Node.js | Host Codex process |
++| `AgentService.executeRun` | `orchestration` | One root span per Run. |
++| Prompt-length guardrail | `policy_decision` | Runs before the Runtime is ever invoked; a real pass/fail check, not just a type. |
++| `codex-runner.ts` / `container-codex-runner.ts` | `sandbox_execution` | Wraps the whole `codex exec` process (local or containerized). |
++| Codex `item.completed` events | `model_call` / `tool_call` / `workspace_operation` | Category and pass/fail status derived from the item's own `type`, `status`, and `exit_code` fields - a failing shell command is a failed span, not a silently "completed" one. |
++| Codex `turn.failed` / `error` events | `model_call` / `orchestration` | Transient stream notices (e.g. `"Reconnecting..."`) are filtered out so they don't falsely flag a span as failed. |
++
++### Redaction
++
++`redactAndSummarize` strips bearer tokens, API-key-shaped strings, and
++password/secret/token fields via regex, and hard-truncates long payloads -
++**before** anything is written to `traces.json`, not just before display.
++
++### Retry chains
++
++A Run's `AgentRun.traceId` links it to its Trace. Retrying a **failed or
++cancelled** Run (`sendMessage(..., { retryOfRunId })`) creates a new Trace
++with `retryOfTraceId` pointing at the one it retries and `attempt`
++incremented. `retriedByTraceId` (the forward link) is computed server-side
++from the whole store on every read, not from any client-side filtered list -
++so a retry stays discoverable from the original failed Trace even if the
++UI's current status filter would otherwise hide the successful retry.
++
++Retrying a Run that didn't actually fail is rejected (`400`), so `attempt`
++counts stay meaningful for audit purposes.
++
++### Live updates
++
++`GET /api/traces/stream` and `GET /api/traces/:id/stream` are Server-Sent
++Event endpoints. `TraceStore` exposes an `onChange` hook fired after every
++successful mutation; the SSE routes push a fresh payload whenever it fires
++(plus a slow interval as a safety net), so the Traces UI never polls.
++
++### Traces UI
++
++A Run list (status-filterable, scoped to one Agent or all) and a trace detail
++view with **Tree** and **Timeline** (waterfall) modes, per-category filter
++chips, a "jump to failing step" control that expands/highlights/scrolls to
++the first failed span, retry chain breadcrumbs (backward and forward), and a
++JSON export of the full trace.
+ 
+ ## Extension seams
+ 
+-| Track | Primary seam | Expected change |
+-| --- | --- | --- |
+-| Glass Box | `AgentRunner`, `AgentRun` | Emit and display correlated execution events. |
+-| Bouncer | API routes, Agent ownership | Add identity and server-side authorization. |
+-| Kill Switch | `AgentRunner` | Add threat-specific policy or a stronger sandbox. |
++| Track       | Primary seam                            | Status                                                                                                                          |
++| ----------- | ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
++| Glass Box   | `AgentRunner`, `AgentRun`, `TraceStore` | **Implemented.** See "Trace and audit middleware" above.                                                                        |
++| Bouncer     | API routes, Agent ownership             | Not implemented - no identity or per-user authorization.                                                                        |
++| Kill Switch | `AgentRunner`                           | Not implemented - no threat-specific policy beyond the prompt-length guardrail, and no hardened sandbox beyond the existing container/process boundary. |
+ 
+ The current container or ECS instance is the POC trust boundary. Ordinary
+-containers are not hardened multi-tenant isolation.
++containers are not hardened multi-tenant isolation. The trace/audit
++middleware makes Runs observable and auditable; it does not add identity,
++authorization, or sandbox hardening.

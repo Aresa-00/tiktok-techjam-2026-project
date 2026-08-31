@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { AgentService } from "./agent-service.js";
 import { loadConfig } from "./config.js";
 import { JsonStore } from "./store.js";
+import { TraceStore } from "./trace-store.js";
 import type { AgentRunner, RunnerRequest, RunnerResult } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
 
@@ -51,6 +52,7 @@ async function makeService(runner: AgentRunner = new FakeRunner()): Promise<Agen
     new JsonStore(path.join(root, "data", "db.json")),
     new WorkspaceManager(path.join(root, "workspaces")),
     runner,
+    new TraceStore(path.join(root, "data", "traces.json")),
   );
   await service.initialize();
   return service;
@@ -129,5 +131,110 @@ describe("Agent lifecycle", () => {
 
     finish({ output: "done", threadId: "thread", usage: null });
     await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+  });
+});
+
+describe("Trace and audit middleware", () => {
+  it("records a Trace with an orchestration root span and a passing policy_decision span", async () => {
+    const service = await makeService();
+    const agent = await service.createAgent({ name: "Traced" });
+    const { run } = await service.sendMessage(agent.id, "write hello world");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    const trace = service.getTraceForRun(run.id);
+    expect(trace.status).toBe("completed");
+    expect(trace.cause).toBe("completed");
+    expect(trace.runId).toBe(run.id);
+    expect(trace.agentId).toBe(agent.id);
+
+    const rootSpan = trace.spans.find((span) => span.category === "orchestration");
+    expect(rootSpan?.status).toBe("completed");
+
+    const policySpan = trace.spans.find((span) => span.category === "policy_decision");
+    expect(policySpan?.status).toBe("completed");
+    expect(policySpan?.output).toContain("true");
+
+    expect(service.getAgent(agent.id).id).toBe(agent.id);
+    const [summary] = service.listTraces({ agentId: agent.id });
+    expect(summary.id).toBe(trace.id);
+    expect(summary.errorSpanCount).toBe(0);
+  });
+
+  it("blocks an over-limit prompt with a failed policy_decision span and never invokes the Runtime", async () => {
+    let invoked = false;
+    const service = await makeService({
+      run: async () => {
+        invoked = true;
+        return { output: "should not run", threadId: null, usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Guarded" });
+    const oversizedPrompt = "x".repeat(20_001);
+    const { run } = await service.sendMessage(agent.id, oversizedPrompt);
+    await expect.poll(() => service.getRun(run.id).status).toBe("failed");
+
+    expect(invoked).toBe(false);
+    const trace = service.getTraceForRun(run.id);
+    expect(trace.status).toBe("failed");
+    expect(trace.cause).toBe("policy_blocked");
+
+    const policySpan = trace.spans.find((span) => span.category === "policy_decision");
+    expect(policySpan?.status).toBe("failed");
+    expect(policySpan?.error).toContain("policy limit");
+
+    expect(service.getAgent(agent.id).lastError).toContain("policy limit");
+  });
+
+  it("links a retry to the failed Run it retries and increments the attempt count", async () => {
+    let shouldFail = true;
+    const service = await makeService({
+      run: async (request) => {
+        if (shouldFail) throw new Error("simulated Runtime failure");
+        return { output: "Completed: " + request.prompt, threadId: "thread", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Flaky" });
+
+    const { run: firstRun } = await service.sendMessage(agent.id, "do the thing");
+    await expect.poll(() => service.getRun(firstRun.id).status).toBe("failed");
+    const firstTrace = service.getTraceForRun(firstRun.id);
+    expect(firstTrace.attempt).toBe(1);
+    expect(firstTrace.retryOfTraceId).toBeNull();
+
+    shouldFail = false;
+    const { run: retryRun } = await service.sendMessage(agent.id, "do the thing", {
+      retryOfRunId: firstRun.id,
+    });
+    await expect.poll(() => service.getRun(retryRun.id).status).toBe("completed");
+    const retryTrace = service.getTraceForRun(retryRun.id);
+    expect(retryTrace.attempt).toBe(2);
+    expect(retryTrace.retryOfTraceId).toBe(firstTrace.id);
+  });
+
+  it("rejects a retry that points at a Run belonging to a different Agent", async () => {
+    const service = await makeService();
+    const agentA = await service.createAgent({ name: "A" });
+    const agentB = await service.createAgent({ name: "B" });
+    const { run } = await service.sendMessage(agentA.id, "hello");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    await expect(
+      service.sendMessage(agentB.id, "hello", { retryOfRunId: run.id }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+  });
+
+  it("rejects retrying a Run that did not fail or get cancelled", async () => {
+    const service = await makeService();
+    const agent = await service.createAgent({ name: "Fine" });
+    const { run } = await service.sendMessage(agent.id, "hello");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    await expect(
+      service.sendMessage(agent.id, "hello", { retryOfRunId: run.id }),
+    ).rejects.toMatchObject({ statusCode: 400 });
   });
 });
