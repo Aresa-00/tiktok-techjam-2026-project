@@ -1,3 +1,4 @@
+import { createRedactor, type Redactor } from "./redaction.js";
 import type { RunUsage } from "./types.js";
 
 export type SpanCategory =
@@ -71,29 +72,52 @@ export interface TraceSummary {
   usage: RunUsage | null;
 }
 
-const SECRET_PATTERNS = [
-  /Bearer\s+[A-Za-z0-9._-]+/gi,
-  /sk-[A-Za-z0-9]{10,}/g,
-  /(api[_-]?key["'=:\s]+)[A-Za-z0-9._-]{8,}/gi,
-  /("?(?:token|password|secret)"?\s*[:=]\s*")[^"]+(")/gi,
-];
+/**
+ * Shared fallback redactor. `TraceStore` is given a redactor configured with
+ * the deployment's literal secrets (ARK_API_KEY, APP_AUTH_TOKEN); anything
+ * that calls these helpers without one still gets the full pattern set.
+ */
+const defaultRedactor = createRedactor();
 
 /**
- * Redacts obvious secrets and caps length so spans never store raw
- * credentials or unbounded payloads. Intentionally conservative: teams
- * extending this should treat "redact before storage" as the invariant,
- * not "redact before display".
+ * Redacts secrets and caps length so spans never store raw credentials or
+ * unbounded payloads. Uses the same detection engine as the RedactingRunner
+ * middleware (`redaction.ts`). Invariant: redact before *storage*, not just
+ * before display.
  */
-export function redactAndSummarize(value: unknown, maxLength = 2_000): string | null {
+export function redactAndSummarize(
+  value: unknown,
+  maxLength = 2_000,
+  redact: Redactor = defaultRedactor,
+): string | null {
   if (value === null || value === undefined) return null;
-  let text = typeof value === "string" ? value : safeStringify(value);
-  for (const pattern of SECRET_PATTERNS) {
-    text = text.replace(pattern, "[REDACTED]");
-  }
+  const raw = typeof value === "string" ? value : safeStringify(value);
+  let text = redact(raw).text;
   if (text.length > maxLength) {
     text = text.slice(0, maxLength) + `… [truncated ${text.length - maxLength} chars]`;
   }
   return text;
+}
+
+/**
+ * Recursively redacts every string in a structured value (span metadata),
+ * leaving numbers, booleans, and null untouched. No length cap — metadata is
+ * expected to be small structured fields, not payloads.
+ */
+export function redactDeep<T>(value: T, redact: Redactor = defaultRedactor): T {
+  if (typeof value === "string") return redact(value).text as T;
+  if (Array.isArray(value)) {
+    return value.map((item) => redactDeep(item, redact)) as T;
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+        key,
+        redactDeep(item, redact),
+      ]),
+    ) as T;
+  }
+  return value;
 }
 
 function safeStringify(value: unknown): string {

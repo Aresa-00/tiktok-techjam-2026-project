@@ -2,8 +2,9 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { HttpError } from "./errors.js";
+import { createRedactor, type Redactor } from "./redaction.js";
 import type { RunUsage } from "./types.js";
-import { redactAndSummarize, type Span, type SpanCategory, type SpanStatus, type Trace, type TraceCause, type TraceSummary } from "./trace-types.js";
+import { redactAndSummarize, redactDeep, type Span, type SpanCategory, type SpanStatus, type Trace, type TraceCause, type TraceSummary } from "./trace-types.js";
 
 interface TraceDatabase {
   version: 1;
@@ -47,10 +48,15 @@ export class TraceStore {
   private queue: Promise<void> = Promise.resolve();
   private readonly listeners = new Set<() => void>();
 
+  private readonly redact: Redactor;
+
   constructor(
     private readonly filePath: string,
     private readonly maxTraces = 300,
-  ) {}
+    redact: Redactor = createRedactor(),
+  ) {
+    this.redact = redact;
+  }
 
   /** Notified after every successful mutation - lets the SSE routes push without polling the filesystem. */
   onChange(listener: () => void): () => void {
@@ -160,10 +166,10 @@ export class TraceStore {
       startedAt: now(),
       endedAt: null,
       durationMs: null,
-      input: redactAndSummarize(input.input),
+      input: redactAndSummarize(input.input, 2_000, this.redact),
       output: null,
       error: null,
-      metadata: input.metadata ?? {},
+      metadata: redactDeep(input.metadata ?? {}, this.redact),
     };
     await this.mutate((database) => {
       const trace = database.traces.find((item) => item.id === traceId);
@@ -180,9 +186,12 @@ export class TraceStore {
       if (!trace || !span) return;
       const endedAt = now();
       span.status = result.status;
-      span.output = redactAndSummarize(result.output);
-      span.error = result.error ?? null;
-      span.metadata = { ...span.metadata, ...(result.metadata ?? {}) };
+      span.output = redactAndSummarize(result.output, 2_000, this.redact);
+      span.error = redactAndSummarize(result.error, 2_000, this.redact);
+      span.metadata = {
+        ...span.metadata,
+        ...redactDeep(result.metadata ?? {}, this.redact),
+      };
       span.endedAt = endedAt;
       span.durationMs = new Date(endedAt).getTime() - new Date(span.startedAt).getTime();
     });
@@ -234,7 +243,10 @@ export class TraceStore {
       // Keep the write queue alive even if one mutation fails to persist -
       // otherwise every later trace write would wait on a rejected promise
       // forever. The failure is still surfaced to whoever called mutate().
-      console.error("[trace-store] failed to persist trace mutation:", error);
+      console.error(
+        "[trace-store] failed to persist trace mutation:",
+        this.redact(String(error)).text,
+      );
     });
     await operation;
   }

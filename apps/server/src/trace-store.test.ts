@@ -2,7 +2,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { redactAndSummarize } from "./trace-types.js";
+import { createRedactor } from "./redaction.js";
+import { redactAndSummarize, redactDeep } from "./trace-types.js";
 import { TraceStore } from "./trace-store.js";
 
 const temporaryDirectories: string[] = [];
@@ -13,11 +14,14 @@ afterEach(async () => {
   );
 });
 
-async function makeStore(maxTraces = 300): Promise<{ store: TraceStore; filePath: string; root: string }> {
+async function makeStore(
+  maxTraces = 300,
+  redact = createRedactor(),
+): Promise<{ store: TraceStore; filePath: string; root: string }> {
   const root = await mkdtemp(path.join(tmpdir(), "launchpad-trace-test-"));
   temporaryDirectories.push(root);
   const filePath = path.join(root, "data", "traces.json");
-  const store = new TraceStore(filePath, maxTraces);
+  const store = new TraceStore(filePath, maxTraces, redact);
   await store.initialize();
   return { store, filePath, root };
 }
@@ -43,6 +47,46 @@ describe("redactAndSummarize", () => {
   it("returns null for null/undefined instead of the string 'null'", () => {
     expect(redactAndSummarize(null)).toBeNull();
     expect(redactAndSummarize(undefined)).toBeNull();
+  });
+
+  it("catches vendor key shapes the old regex list missed", () => {
+    const text = redactAndSummarize(
+      "aws AKIAIOSFODNN7EXAMPLE and gh ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 done",
+    );
+    expect(text).not.toContain("AKIAIOSFODNN7EXAMPLE");
+    expect(text).not.toContain("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789");
+  });
+
+  it("honours a caller-supplied redactor with configured literals", () => {
+    const redact = createRedactor({ literals: ["ark-secret-abcdef123456"] });
+    const text = redactAndSummarize(
+      "connecting with ark-secret-abcdef123456",
+      2_000,
+      redact,
+    );
+    expect(text).toBe("connecting with [REDACTED]");
+  });
+});
+
+describe("redactDeep", () => {
+  it("redacts strings at any depth and leaves non-strings alone", () => {
+    const redact = createRedactor({ literals: ["ark-secret-abcdef123456"] });
+    expect(
+      redactDeep(
+        {
+          provider: "local-process",
+          attempts: 2,
+          creds: { header: "Authorization: Bearer abcdef12345678", ok: true },
+          notes: ["uses ark-secret-abcdef123456", "nothing here"],
+        },
+        redact,
+      ),
+    ).toEqual({
+      provider: "local-process",
+      attempts: 2,
+      creds: { header: "Authorization: Bearer [REDACTED]", ok: true },
+      notes: ["uses [REDACTED]", "nothing here"],
+    });
   });
 });
 
@@ -109,6 +153,39 @@ describe("TraceStore span lifecycle", () => {
     const storedSpan = stored.spans[0];
     expect(storedSpan.input).not.toContain("sk-thisisasecretkey1234");
     expect(storedSpan.output).not.toContain("another-secret");
+  });
+
+  it("redacts the span error and metadata, not just input/output", async () => {
+    const { store } = await makeStore(
+      300,
+      createRedactor({ literals: ["ark-live-key-abcdef123456"] }),
+    );
+    const trace = await store.createTrace({
+      agentId: "agent-1",
+      agentVersion: "v1",
+      runId: "run-1",
+      sessionId: null,
+      actorType: "user",
+    });
+    const span = await store.startSpan(trace.id, {
+      name: "codex exec",
+      category: "sandbox_execution",
+      metadata: { launchedWith: "ARK_API_KEY=ark-live-key-abcdef123456" },
+    });
+    await store.endSpan(trace.id, span.id, {
+      status: "failed",
+      error:
+        "auth failed for ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 using ark-live-key-abcdef123456",
+      metadata: { lastHeader: "Authorization: Bearer eyJ.some.jwtvalue1234567" },
+    });
+
+    const storedSpan = store.getTrace(trace.id).spans[0]!;
+    const serialized = JSON.stringify(storedSpan);
+    expect(serialized).not.toContain("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789");
+    expect(serialized).not.toContain("ark-live-key-abcdef123456");
+    expect(serialized).not.toContain("jwtvalue1234567");
+    expect(storedSpan.error).toContain("[REDACTED]");
+    expect(storedSpan.metadata.launchedWith).toBe("ARK_API_KEY=[REDACTED]");
   });
 
   it("records a single-event audit entry via recordInstant", async () => {

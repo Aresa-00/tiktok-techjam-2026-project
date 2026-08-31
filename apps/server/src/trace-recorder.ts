@@ -1,4 +1,7 @@
+import { createRedactor } from "./redaction.js";
 import type { EndSpanInput, StartSpanInput, TraceStore } from "./trace-store.js";
+
+const redactForLog = createRedactor();
 
 /**
  * Bound to one Trace. Runners and the sandbox layer call this instead of
@@ -40,7 +43,10 @@ export class TraceRecorder {
     const results = await Promise.allSettled(this.pending.splice(0, this.pending.length));
     for (const result of results) {
       if (result.status === "rejected") {
-        console.error("[trace-recorder] a span write failed and was dropped:", result.reason);
+        console.error(
+          "[trace-recorder] a span write failed and was dropped:",
+          redactForLog(String(result.reason)).text,
+        );
       }
     }
   }
