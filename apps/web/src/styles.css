@@ -824,6 +824,23 @@ textarea:focus {
   font-size: 11px;
 }
 
+.redaction-notice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  align-self: flex-start;
+  max-width: 100%;
+  border-left: 2px solid var(--green);
+  background: #edf5f1;
+  padding: 8px 12px;
+  color: #2f6b53;
+  font-size: 11px;
+}
+
+.redaction-notice span:last-child {
+  overflow-wrap: anywhere;
+}
+
 .composer {
   margin: 0;
   border-top: 1px solid #e1dfd8;

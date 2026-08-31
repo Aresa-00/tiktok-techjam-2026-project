@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { AppConfig } from "./config.js";
 import { isArkConfigured } from "./config.js";
 import { HttpError, RunCancelledError } from "./errors.js";
+import { RedactedError } from "./redacting-runner.js";
 import { JsonStore } from "./store.js";
 import type {
   Agent,
@@ -31,6 +32,7 @@ export class AgentService {
     await this.workspaces.initialize();
     await this.store.mutate((database) => {
       for (const run of database.runs) {
+        run.redactions ??= [];
         if (run.status === "queued" || run.status === "running") {
           run.status = "cancelled";
           run.error = "Server restarted while this run was active";
@@ -170,6 +172,7 @@ export class AgentService {
       output: null,
       error: null,
       usage: null,
+      redactions: [],
       startedAt: null,
       completedAt: null,
       createdAt: timestamp,
@@ -258,6 +261,7 @@ export class AgentService {
         storedRun.status = "completed";
         storedRun.output = result.output;
         storedRun.usage = result.usage;
+        storedRun.redactions = result.redactions ?? [];
         storedRun.completedAt = completedAt;
         database.messages.push({
           id: randomUUID(),
@@ -276,12 +280,14 @@ export class AgentService {
       const completedAt = now();
       const cancelled = error instanceof RunCancelledError;
       const message = error instanceof Error ? error.message : String(error);
+      const redactions = error instanceof RedactedError ? error.redactions : [];
       await this.store.mutate((database) => {
         const storedRun = database.runs.find((item) => item.id === run.id);
         const agent = database.agents.find((item) => item.id === agentAtStart.id);
         if (storedRun) {
           storedRun.status = cancelled ? "cancelled" : "failed";
           storedRun.error = message;
+          storedRun.redactions = redactions;
           storedRun.completedAt = completedAt;
         }
         if (agent) {

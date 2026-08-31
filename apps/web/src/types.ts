@@ -23,6 +23,12 @@ export interface Message {
   createdAt: string;
 }
 
+export interface RunRedaction {
+  scope: "output" | "error";
+  rule: string;
+  count: number;
+}
+
 export interface AgentRun {
   id: string;
   agentId: string;
@@ -35,6 +41,7 @@ export interface AgentRun {
     cachedInputTokens?: number;
     outputTokens?: number;
   } | null;
+  redactions?: RunRedaction[];
   createdAt: string;
 }
 

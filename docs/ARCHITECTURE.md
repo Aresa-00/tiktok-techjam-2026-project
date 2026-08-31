@@ -62,6 +62,18 @@ one process only.
 Both providers use argv-only process execution, bound output and time, resume
 the stored Codex thread, and escalate termination after a grace period.
 
+### Redaction middleware
+
+`RedactingRunner` decorates the active `AgentRunner`. Before an agent message
+or error message reaches the store or the API, it replaces anything matching a
+credential shape (vendor API keys, tokens, passwords, private keys, the
+configured `ARK_API_KEY`) with `[REDACTED]`.
+
+Each turn records a `redactions: { scope, rule, count }[]` summary on its
+`AgentRun` — never the secret value — which the API returns and the Web UI
+shows as a notice under the response. A `RedactionSink` callback also fires per
+event for audit logging. Disable with `REDACT_SECRETS=false`.
+
 ## Deployment profiles
 
 | Profile | Control plane | Agent execution |
