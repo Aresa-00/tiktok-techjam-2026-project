@@ -4,16 +4,21 @@ Volc Agent Launchpad is a single-node control plane for hackathon use.
 
 ```mermaid
 flowchart LR
-    UI["React Web UI"] --> API["Fastify API"]
+    UI["React Web UI<br/>(Playground + Traces)"] --> API["Fastify API"]
     API --> Service["AgentService"]
-    Service --> Store["JSON store"]
+    Service --> Store["JsonStore<br/>(launchpad.json)"]
     Service --> Workspace["Agent workspace"]
-    Service --> Runner{"AgentRunner"}
-    Runner -->|Local POC| Container["Disposable Runtime container"]
-    Runner -->|ECS| Process["Codex child process"]
+    Service --> Runner["RedactingRunner"]
+    Runner --> Base{"AgentRunner"}
+    Base -->|container| Container["Disposable Runtime container"]
+    Base -->|local-process| Process["Codex child process"]
     Container --> Ark["Volcengine Ark"]
     Process --> Ark
-    Service --> Traces["TraceStore"]
+    Service --> Traces["TraceStore<br/>(traces.json)"]
+    Base -. spans .-> Traces
+    Runner -. redact .-> Redaction["redaction.ts"]
+    Traces -. redact .-> Redaction
+    Traces -->|SSE| UI
 ```
 
 ## Components
@@ -126,7 +131,7 @@ sequenceDiagram
   (Codex thread), `actorType`, `status`, `cause`, `retryOfTraceId`,
   `retriedByTraceId`, `attempt`, timing, token `usage`, and its `spans`.
 - **Span** - `id`, `traceId`, `parentSpanId`, `name`, `category`, `status`,
-  timing, redacted `input`/`output`, `error`, `metadata`.
+  timing, and redacted `input` / `output` / `error` / `metadata`.
 - **Span categories**: `orchestration`, `model_call`, `tool_call`,
   `sandbox_execution`, `workspace_operation`, `policy_decision`.
 - **Trace causes**: `completed`, `user_requested_stop`, `policy_blocked`,
@@ -146,9 +151,14 @@ sequenceDiagram
 
 ### Redaction
 
-`redactAndSummarize` strips bearer tokens, API-key-shaped strings, and
-password/secret/token fields via regex, and hard-truncates long payloads -
-**before** anything is written to `traces.json`, not just before display.
+`redactAndSummarize` and `redactDeep` run every span `input`, `output`,
+`error`, and `metadata` field through the same detection engine as the
+`RedactingRunner` middleware (`redaction.ts` - vendor key shapes, JWTs, private
+keys, URL credentials, `password` / `token` / `secret` assignments, and the
+deployment's literal `ARK_API_KEY` / `APP_AUTH_TOKEN`), then hard-truncate long
+payloads. This happens **before** anything is written to `traces.json`, not
+just before display. The Fastify error handler scrubs error messages and stack
+traces the same way.
 
 ### Retry chains
 
@@ -182,7 +192,7 @@ JSON export of the full trace.
 
 | Track       | Primary seam                            | Status                                                                                                                          |
 | ----------- | ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| Glass Box   | `AgentRunner`, `AgentRun`, `TraceStore` | **Implemented.** See "Trace and audit middleware" above.                                                                        |
+| Glass Box   | `RedactingRunner`, `TraceStore`, `redaction.ts` | **Implemented.** Trace/audit middleware plus secret redaction across output, errors, spans, and logs. See "Trace and audit middleware" and "Redaction middleware" above. |
 | Bouncer     | API routes, Agent ownership             | Not implemented - no identity or per-user authorization.                                                                        |
 | Kill Switch | `AgentRunner`                           | Not implemented - no threat-specific policy beyond the prompt-length guardrail, and no hardened sandbox beyond the existing container/process boundary. |
 

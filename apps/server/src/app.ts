@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import type { AppConfig } from "./config.js";
 import { HttpError } from "./errors.js";
+import { createRedactor } from "./redaction.js";
 import type { AgentService } from "./agent-service.js";
 
 const agentIdParams = z.object({ id: z.string().uuid() });
@@ -34,6 +35,10 @@ export async function createApp(
   config: AppConfig,
   service: AgentService,
 ): Promise<FastifyInstance> {
+  const redact = createRedactor({
+    literals: [config.authToken, config.arkApiKey],
+  });
+
   const app = Fastify({
     logger: {
       level: config.logLevel,
@@ -256,6 +261,10 @@ export async function createApp(
 
   app.setErrorHandler((error, request, reply) => {
     const appError = error instanceof Error ? error : new Error(String(error));
+    // Never let a secret ride out in an error message - to the client or the
+    // log. The stack's first line embeds the original message, so scrub both.
+    appError.message = redact(appError.message).text;
+    if (appError.stack) appError.stack = redact(appError.stack).text;
     const validationError = error instanceof z.ZodError;
     const frameworkStatus =
       typeof (error as { statusCode?: unknown }).statusCode === "number"
